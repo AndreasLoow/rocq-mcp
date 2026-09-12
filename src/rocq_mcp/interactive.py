@@ -180,6 +180,219 @@ def _compute_hard_timeout(soft_timeout: float) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Preamble / import validation
+# ---------------------------------------------------------------------------
+# ``get_state_at_pos`` returns a state even when a command in the document was
+# rejected: coq-lsp reports the rejection as a document diagnostic, and
+# petanque's protocol carries no diagnostics.  A ``Require`` of a library whose
+# ``.vo`` is inconsistent with its dependencies therefore used to come back as
+# a *successful* start over an environment missing every requested import — the
+# caller only learned of it later, through a downstream "reference not found"
+# that names neither library nor remedy.
+#
+# ``pet.run`` does surface the error, so we re-run the document's leading
+# import sentences from its root state and report what Rocq raises.  A healthy
+# preamble no-ops (the libraries are already loaded in this pet); a broken one
+# raises the message Rocq would have printed all along.
+
+
+@dataclass(frozen=True)
+class _PreambleFailure:
+    """A preamble/import command Rocq rejected, with the error it raised."""
+
+    command: str
+    message: str
+
+
+class _PreambleError(Exception):
+    """Raised by :func:`_get_or_create_import_state` on a rejected preamble.
+
+    Carries the :class:`_PreambleFailure` so the call site can build the
+    tool-specific failure envelope (see :func:`_preamble_failure_response`).
+    """
+
+    def __init__(self, failure: _PreambleFailure) -> None:
+        super().__init__(failure.message)
+        self.failure = failure
+
+
+# The sentences replayed, and the rule that keeps the replay honest: only the
+# *leading run* of these is re-executed, from the document's root state, so the
+# replay is the same prefix in the same order from the same starting point as
+# the original run.  The first sentence that is not one of these ends the
+# prefix — a ``Section`` or ``Module`` would change the context every later
+# command runs in, and a ``Definition`` or ``Notation`` would fail on re-entry
+# ("already exists") for a reason that has nothing to do with the imports.
+# Within the prefix every command is idempotent: re-requiring a loaded library,
+# re-importing it, re-opening a scope and re-setting a flag are all no-ops.
+_REPLAYABLE_PREAMBLE_RE = re.compile(
+    r"""^\s*
+    (?:\#\[[^\]]*\]\s*)?                    # attribute block
+    (?:(?:Local|Global)\s+)?
+    (?: (?:From\s+[\w.']+\s+)?Require\b
+      | Import\b
+      | Export\b
+      | Open\s+Scope\b
+      | (?:Set|Unset)\s+[A-Z]
+      )
+    """,
+    re.VERBOSE,
+)
+
+# Library-level load failures.  These are the only replay errors trusted to
+# *override* an error Rocq already reported on another path: both name the
+# libraries involved and point at the remedy, whereas any other replay error is
+# more likely an artefact of the replay than the root cause.
+_LIBRARY_ERROR_RE = re.compile(
+    r"makes inconsistent assumptions over|(?:Cannot find|Unable to locate) library",
+)
+
+# Attached to a library-level failure: the two states of the world that produce
+# one, and the fix for each.
+_STALE_VO_HINT = (
+    "A compiled .vo disagrees with the .vo it was built against, or cannot be "
+    "found. Rebuild the project (dune build / make / coqc) so every .vo agrees. "
+    "If the build is already clean, this pet process is still holding a library "
+    "loaded before the rebuild — reload it with "
+    "rocq_start(..., force_restart=True)."
+)
+
+
+def _leading_import_prefix(commands: list[str]) -> list[str]:
+    """Return the leading run of *commands* that is safe to replay.
+
+    Stops at the first sentence :data:`_REPLAYABLE_PREAMBLE_RE` does not
+    match — see the note there for why the prefix, and not a filter, is the
+    honest unit.  Comments are neutralised first so a sentence carrying the
+    file's header comment still matches on the vernacular that follows it.
+    """
+    from rocq_mcp.verify import _neutralize_for_regex
+
+    prefix: list[str] = []
+    for cmd in commands:
+        if not _REPLAYABLE_PREAMBLE_RE.match(_neutralize_for_regex(cmd)):
+            break
+        prefix.append(cmd)
+    return prefix
+
+
+def _replay_import_prefix(
+    pet: Any,
+    file: str,
+    commands: list[str],
+    lifespan_state: dict[str, Any],
+) -> _PreambleFailure | None:
+    """Re-run *file*'s leading import prefix from its root state.
+
+    *commands* is *file*'s full sentence list; :func:`_leading_import_prefix`
+    picks the part that gets replayed.  Each command runs on the state the
+    previous one produced, so an ``Open Scope`` still sees the ``Require``
+    before it; the resulting states are transient — only the error matters.
+
+    Returns ``None`` when every replayed command is accepted, when there is
+    nothing to replay, or when this pet has no ``get_root_state`` route (an
+    older petanque): validation is best-effort and must never invent a
+    failure.  Re-raises :class:`PetanqueError` when the pet process itself
+    died, so ``_run_with_pet`` still reports ``pet_restarted``.
+    """
+    try:
+        from pytanque import PetanqueError
+    except ImportError:  # pragma: no cover - pytanque optional
+        return None
+
+    prefix = _leading_import_prefix(commands)
+    if not prefix:
+        return None
+    try:
+        current = pet.get_root_state(file)
+    except Exception:
+        # A pet that died during the probe still has to surface as a restart.
+        if not _server._pet_alive(lifespan_state.get("pet_client")):
+            raise
+        return None
+
+    for cmd in prefix:
+        try:
+            current = pet.run(current, cmd)
+        except PetanqueError as e:
+            if not _server._pet_alive(lifespan_state.get("pet_client")):
+                raise
+            return _PreambleFailure(command=cmd, message=e.message)
+    return None
+
+
+def _preamble_failure_response(
+    lifespan_state: dict[str, Any] | None,
+    tool: str,
+    failure: _PreambleFailure,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Build the failure envelope for a preamble command Rocq rejected.
+
+    Reports the Rocq error verbatim — for a stale ``.vo`` it is the only
+    message that names both libraries — under ``reason="preamble_failed"`` so
+    a caller can tell "your imports did not load" from a rejected tactic.
+    """
+    extra["failed_command"] = failure.command
+    if _LIBRARY_ERROR_RE.search(failure.message):
+        extra["hint"] = _STALE_VO_HINT
+    return _server._fail(
+        lifespan_state,
+        tool,
+        failure.message,
+        reason="preamble_failed",
+        **extra,
+    )
+
+
+def _names_may_contain(theorem: str, names: list[str]) -> bool:
+    """Whether *theorem* plausibly names something in a file's toc.
+
+    Gates the library probe on the theorem-lookup path: a name that is not
+    in the file is a typo, and replaying the file's imports to explain it
+    would be a wasted library load on the commonest error there is.  An
+    empty *names* (the toc lookup itself failed) counts as no evidence
+    either way, so the probe runs.  Matching is by last component so a
+    qualified ``M.thm`` still finds the flattened ``thm`` pet reports.
+    """
+    if not names:
+        return True
+    if theorem in names:
+        return True
+    tail = theorem.rsplit(".", 1)[-1]
+    return any(tail == name.rsplit(".", 1)[-1] for name in names)
+
+
+def _file_library_error(
+    pet: Any,
+    resolved_file: str,
+    lifespan_state: dict[str, Any],
+) -> _PreambleFailure | None:
+    """Replay *resolved_file*'s own imports; report a library-level failure.
+
+    Explains a lookup that failed for a reason which is not about the name
+    looked up at all: when a dependency's ``.vo`` is stale, pet reports the
+    downstream symptom ("The reference b was not found in the current
+    environment") while the file's ``Require`` line raises the message that
+    names both libraries.
+
+    Returns ``None`` unless the replay reproduces a :data:`_LIBRARY_ERROR_RE`
+    failure, so nothing else the replay stumbles over can mask the error pet
+    actually reported.
+    """
+    try:
+        source = Path(resolved_file).read_text()
+    except OSError:
+        return None
+    failure = _replay_import_prefix(
+        pet, resolved_file, _split_rocq_sentences(source), lifespan_state
+    )
+    if failure is None or not _LIBRARY_ERROR_RE.search(failure.message):
+        return None
+    return failure
+
+
+# ---------------------------------------------------------------------------
 # Import cache
 # ---------------------------------------------------------------------------
 
@@ -194,6 +407,11 @@ class _CachedImportContext:
     imports_hash: str
     workspace: str
     pet_generation: int
+    # Workspace .vo epoch when the state was built.  A compile through this
+    # server that rewrote a .vo bumps the epoch; the cached state froze the
+    # libraries loaded before it, so it must not be handed out afterwards
+    # (see server._current_vo_epoch and _check_staleness).
+    vo_epoch: int = 0
 
 
 _import_cache: dict[str, _CachedImportContext] = {}
@@ -212,15 +430,28 @@ def _get_or_create_import_state(
     processes them natively, then calls ``get_state_at_pos`` at the end
     of the file.  Subsequent calls with the same imports and workspace
     return the cached State instantly (skipping import re-processing).
+    A cache entry is also retired once the workspace's ``.vo`` epoch moves
+    on: a compile through this server rebuilt a library the state had
+    already loaded, so the cached environment no longer matches disk.
+
+    Freshly built states are validated before being cached: coq-lsp
+    swallows a rejected command into a diagnostic the protocol does not
+    carry, so a failed ``Require`` would otherwise be returned as a state
+    silently missing every requested import.  Raises
+    :class:`_PreambleError` when a command in *import_commands* is
+    rejected; the failing state is not cached, so a later call retries it
+    after a rebuild.
     """
     imports_key = hashlib.sha256("\n".join(import_commands).encode()).hexdigest()
     ws = str(Path(workspace).resolve())
+    vo_epoch = _server._current_vo_epoch(lifespan_state, ws)
 
     cached = _import_cache.get(imports_key)
     if (
         cached
         and cached.workspace == ws
         and cached.pet_generation == _import_cache_generation
+        and cached.vo_epoch == vo_epoch
     ):
         return cached.state
 
@@ -245,11 +476,18 @@ def _get_or_create_import_state(
     end_line = cache_content.count("\n") + 1
     state = pet.get_state_at_pos(str(cache_file), end_line, 0)
 
+    failure = _replay_import_prefix(
+        pet, str(cache_file), import_commands, lifespan_state
+    )
+    if failure is not None:
+        raise _PreambleError(failure)
+
     _import_cache[imports_key] = _CachedImportContext(
         state=state,
         imports_hash=imports_key,
         workspace=ws,
         pet_generation=_import_cache_generation,
+        vo_epoch=vo_epoch,
     )
 
     # Bound cache size (FIFO eviction)
@@ -679,9 +917,16 @@ async def run_query(
             preamble_cmds = (
                 _split_rocq_sentences(preamble_text) if preamble_text else []
             )
-            state = _get_or_create_import_state(
-                pet, workspace, preamble_cmds, lifespan_state
-            )
+            try:
+                state = _get_or_create_import_state(
+                    pet, workspace, preamble_cmds, lifespan_state
+                )
+            except _PreambleError as e:
+                return _preamble_failure_response(
+                    lifespan_state if auto_record else None,
+                    "rocq_query",
+                    e.failure,
+                )
 
         cmd = command.strip()
         if not cmd.endswith("."):
@@ -1552,7 +1797,22 @@ def _build_theorem_start_result(
                 capped, truncated = _truncate_names(all_names)
                 avail = _AvailableInFile(capped, truncated, len(all_names))
             except Exception:
+                all_names = []
                 avail = _AvailableInFile([], False, 0)
+            # A lookup of a name that *is* in the file did not fail because
+            # of the name: the file's own imports are the usual suspect, and
+            # only they name the broken library and the remedy.  pet reports
+            # the downstream symptom instead ("The reference b was not found
+            # in the current environment"), which points nowhere useful.
+            if _names_may_contain(theorem, all_names):
+                root_cause = _file_library_error(pet, resolved_file, lifespan_state)
+                if root_cause is not None:
+                    return _preamble_failure_response(
+                        lifespan_state,
+                        "rocq_start",
+                        root_cause,
+                        lookup_error=e.message,
+                    )
             resp: dict[str, Any] = {
                 "success": False,
                 "error": e.message,
@@ -1604,9 +1864,15 @@ def _build_preamble_start_result(
 ) -> dict[str, Any]:
     """Return the rocq_start-style payload for a preamble-based state."""
     preamble_cmds = _split_rocq_sentences(preamble) if preamble.strip() else []
-    import_state = _get_or_create_import_state(
-        pet, workspace, preamble_cmds, lifespan_state
-    )
+    try:
+        import_state = _get_or_create_import_state(
+            pet, workspace, preamble_cmds, lifespan_state
+        )
+    except _PreambleError as e:
+        # A preamble that did not load is not a session: returning a state_id
+        # here would hand back an environment missing exactly the imports the
+        # caller asked for, with nothing in the response to say so.
+        return _preamble_failure_response(lifespan_state, "rocq_start", e.failure)
     state_id = _state_add(
         state=import_state,
         file="<preamble>",

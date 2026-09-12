@@ -917,6 +917,8 @@ class TestExtraValidationRecording:
             "not_found",
             # rocq_check mid-batch
             "tactic_failed",
+            # rocq_start / rocq_query imports
+            "preamble_failed",
             # rocq_verify-specific
             "compile_error",
             "axiom_dependency",
@@ -952,6 +954,7 @@ class TestExtraValidationRecording:
                 "validation",
                 "not_found",
                 "tactic_failed",
+                "preamble_failed",
                 "compile_error",
                 "axiom_dependency",
                 "type_mismatch",

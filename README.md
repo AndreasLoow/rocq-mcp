@@ -164,6 +164,45 @@ For mid-proof queries — e.g. `Search` against the live proof state —
 use `from_state=<state_id>` instead of preamble; the live state
 already has all imports and scopes set up.
 
+### Imports that do not load
+
+A `Require` can fail even though the library exists — most often because
+its `.vo` on disk was built against an older version of one of *its*
+dependencies:
+
+    Compiled library Repro.B (in file .../B.vo) makes inconsistent
+    assumptions over library Repro.A
+
+`coq-lsp` reports such a rejection as a document diagnostic, which the
+petanque protocol does not carry, so the underlying "state at the end of
+the preamble" call comes back happily — over an environment missing
+every import that was asked for.  `rocq-mcp` therefore re-runs the
+preamble's leading `Require` / `Import` / `Open Scope` / `Set` sentences
+from the document's root state — a no-op when they did load, since the
+libraries are already in this `pet` — and reports what Coq raises:
+
+    {"success": false, "reason": "preamble_failed",
+     "error": "Compiled library Repro.B (in file .../B.vo) makes
+               inconsistent assumptions over library Repro.A",
+     "failed_command": "Require Import Repro.B.",
+     "hint": "..."}
+
+`rocq_start(file=..., theorem=...)` gets the same treatment from the
+other end: when a theorem that *is* in the file cannot be elaborated,
+the file's own `Require` lines are replayed and a library-level failure
+is reported in place of the downstream symptom (`The reference b was not
+found in the current environment`), which names neither library nor
+remedy.  The original lookup error is kept as `lookup_error`.
+
+The two fixes, in order:
+
+1. **Rebuild.** `dune build` / `make` / `coqc` so every `.vo` agrees.
+2. **`rocq_start(..., force_restart=True)`.** If the build is already
+   clean, `pet` is holding a library it loaded *before* the rebuild.
+   Restarting drops it.  A rebuild through `rocq_compile_file` already
+   retires the matching import-cache entries on its own (it advances the
+   workspace's `.vo` epoch); an external `dune build` is not observed.
+
 ### Failure envelope and `reason` taxonomy
 
 Every failure response carries `{success: False, error: str, reason: str}` so an agent can dispatch on `reason` without parsing message text. The same `reason` is recorded into the `recent_errors` ring buffer that `rocq_diag` returns. Values:
@@ -173,6 +212,7 @@ Every failure response carries `{success: False, error: str, reason: str}` so an
 - **Background**: `"crashed"` when a handed-off job raised in the background rather than under a caller; the `error` names the tool it escaped from and is delivered by whichever `rocq_poll` collects it.
 - **Pet-side** (set by `_run_with_pet` on subprocess-level failures): `"timeout"`, `"crashed"`, `"memory_exhausted"`, `"lock_contended"`, `"unavailable"`. When pet had to be killed, the response also carries `pet_restarted: True`.
 - **`rocq_check` mid-batch**: `"tactic_failed"` (Coq rejected the tactic — distinct from a transport-level `"crashed"`).
+- **`rocq_start` / `rocq_query` imports**: `"preamble_failed"` (Coq rejected a `Require` / `Import` / `Open Scope`, so the environment you asked for was never built). The response carries `failed_command`; a library-level failure also carries a `hint`. See **Imports that do not load**.
 - **`rocq_compile` / `rocq_compile_file`**: `"compile_error"` (coqc returned non-zero).
 - **`rocq_verify`-specific**: `"compile_error"`, `"axiom_dependency"` (proof relies on `Admitted`/admit/custom axiom), `"type_mismatch"` (Phase 3 found the proof's type differs from the problem's type).
 

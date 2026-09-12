@@ -1293,6 +1293,10 @@ _RECENT_ERROR_REASONS: frozenset[str] = _PET_SIDE_FAILURE_REASONS | frozenset(
         "not_found",
         # rocq_check mid-batch failure (a tactic was rejected by Coq).
         "tactic_failed",
+        # A preamble / import command was rejected — the environment the
+        # caller asked for never came into being (see
+        # ``interactive._preamble_failure_response``).
+        "preamble_failed",
         # rocq_verify-specific reasons (see compile.run_verify).
         "compile_error",
         "axiom_dependency",
@@ -2336,6 +2340,11 @@ async def rocq_query(
             ``rocq_step_multi``) to query against.  Mutually exclusive with
             *file*.  When set, *preamble* is ignored.
 
+    On a preamble Rocq rejected (typically a ``Require`` against a stale
+    ``.vo``): ``{success: False, reason: "preamble_failed"}`` with the
+    Rocq error verbatim and ``failed_command``.  The query never runs
+    against a half-built environment.
+
     On ``pet_restarted: True``, call ``rocq_diag`` for memory headroom and
     recent error history.
     """
@@ -2695,6 +2704,19 @@ async def rocq_start(
             clamping fires the response includes ``clamped_timeout:
             <cap>`` so the caller can diagnose unexpected timeouts.
 
+    On a preamble Rocq rejected: ``{success: False, reason:
+    "preamble_failed"}`` with the Rocq error verbatim and
+    ``failed_command`` naming the sentence that raised it.  A start whose
+    imports did not load is never reported as a success — the environment
+    the caller asked for does not exist.  The same envelope replaces the
+    downstream "reference not found" in theorem mode when the file's own
+    ``Require`` turns out to be what failed (the original lookup error is
+    kept as ``lookup_error``).  A library-level failure — a stale ``.vo``
+    ("makes inconsistent assumptions over") or a missing one — also
+    carries a ``hint``: rebuild the project, or, when the build is already
+    clean, ``rocq_start(..., force_restart=True)`` to drop the library
+    this pet loaded before the rebuild.
+
     On theorem-not-found errors: response includes ``available_in_file:
     list[str]`` with the file's defined names (sorted, capped — see
     ``available_in_file_limit`` in the response when truncated).  When the
@@ -3043,6 +3065,9 @@ async def rocq_diag(ctx: Context = None) -> dict[str, Any]:
         ``"not_found"`` (rocq_start / rocq_assumptions on a typo).
       - **rocq_check mid-batch**: ``"tactic_failed"`` (a tactic was
         rejected by Coq — distinct from a transport-level ``"crashed"``).
+      - **rocq_start / rocq_query imports**: ``"preamble_failed"`` (Rocq
+        rejected a ``Require`` / ``Open Scope`` — typically a stale
+        ``.vo``; the response also carries ``failed_command``).
       - **rocq_verify-specific**: ``"compile_error"``,
         ``"axiom_dependency"``, ``"type_mismatch"``.
 
