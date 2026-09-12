@@ -1351,6 +1351,105 @@ async def run_notations(
 _MAX_STEP_MULTI_TACTICS = 20
 
 
+# Longest ``resolved.line_text`` echoed back; a pathological single-line
+# file should not push a diagnostic aid past the useful part of a response.
+_RESOLVED_LINE_TEXT_CAP: int = 200
+
+_WHERE_VALUES: tuple[str, ...] = ("after", "before")
+
+
+def _read_source_lines(resolved_file: str) -> list[str] | None:
+    """The file's lines, or None if it cannot be read.
+
+    Only ever used to *aid* a position query — a read failure downgrades
+    to the caller's literal position rather than failing the call, since
+    petanque reads the file itself and may well succeed where this does
+    not.
+    """
+    try:
+        with open(resolved_file, encoding="utf-8", errors="replace") as handle:
+            return handle.read().splitlines()
+    except OSError:
+        return None
+
+
+def _position_for_where(
+    resolved_file: str, line: int, character: int, where: str
+) -> tuple[int, int]:
+    """Translate ``where="before"`` into a column petanque rounds correctly.
+
+    Petanque resolves a cursor by rounding forward through the sentence
+    containing it, so the state *before* a sentence is addressed by
+    pointing at the whitespace ahead of that sentence's first character.
+    Computing that column is the single most error-prone part of using
+    position mode, so this does it from the source text:
+
+    - an indented line: column 0 is already whitespace before the
+      sentence, so use it;
+    - a line starting at column 0: the whitespace before it is the end
+      of the previous line, which is whitespace *after* the previous
+      sentence's period — the same state.
+
+    ``where="after"`` and any position that cannot be improved on are
+    returned unchanged.  A line that only continues a sentence begun
+    earlier has no "before" of its own; column 0 there still lies inside
+    that sentence and rounds forward exactly as ``"after"`` would, which
+    is why the caller is told the effective position in ``resolved``.
+    """
+    if where != "before":
+        return line, character
+    lines = _read_source_lines(resolved_file)
+    if lines is None or line >= len(lines):
+        return line, character
+    text = lines[line]
+    if len(text) - len(text.lstrip()) > 0:
+        return line, 0
+    if line > 0:
+        return line - 1, len(lines[line - 1])
+    return line, character
+
+
+def _resolved_report(
+    resolved_file: str,
+    *,
+    line: int,
+    character: int,
+    where: str,
+    requested: tuple[int, int],
+) -> dict[str, Any]:
+    """Explain which position an empty-goals answer actually came from.
+
+    Reading ``goals: ""`` and concluding the tool is broken is the usual
+    outcome of a cursor one column too far right, so an empty answer says
+    where it looked and how to ask for the other side.
+    """
+    report: dict[str, Any] = {
+        "line": line,
+        "character": character,
+        "where": where,
+    }
+    if (line, character) != requested:
+        report["requested"] = {"line": requested[0], "character": requested[1]}
+    lines = _read_source_lines(resolved_file)
+    if lines is not None and 0 <= line < len(lines):
+        report["line_text"] = lines[line][:_RESOLVED_LINE_TEXT_CAP]
+    if where == "before":
+        report["note"] = (
+            "This is the state BEFORE the sentence beginning on this line. "
+            "Empty goals mean no proof is open there — check the line "
+            "number, or ask for where='after' to see the state the "
+            "sentence produces."
+        )
+    else:
+        report["note"] = (
+            "This is the state AFTER the sentence the cursor rounds "
+            "forward into, which is empty once that sentence closes the "
+            "proof. To see the goals the sentence was applied to, call "
+            "rocq_start again with where='before'."
+        )
+    return report
+
+
 def _build_position_start_result(
     pet: Any,
     *,
@@ -1360,6 +1459,7 @@ def _build_position_start_result(
     lifespan_state: dict[str, Any],
     line: int,
     character: int,
+    where: str = "after",
     track_staleness: bool = True,
 ) -> dict[str, Any]:
     """Return the rocq_start-style payload for a position-based state.
@@ -1370,7 +1470,14 @@ def _build_position_start_result(
     state AFTER that sentence; a cursor in the whitespace before a
     sentence yields the state BEFORE it.  See ``rocq_start`` for the
     full rule.
+
+    ``where="before"`` asks for the other side of the sentence beginning
+    on ``line`` without the caller computing that column itself; the
+    position actually used is reported in ``resolved`` whenever the
+    goals come back empty.
     """
+    requested = (line, character)
+    line, character = _position_for_where(resolved_file, line, character, where)
     _server._set_workspace_if_needed(pet, workspace, lifespan_state)
     state = pet.get_state_at_pos(resolved_file, line, character)
 
@@ -1407,6 +1514,14 @@ def _build_position_start_result(
     }
     if focus_depth is not None:
         result["focus_depth"] = focus_depth
+    if not result["goals"] or result["proof_finished"]:
+        result["resolved"] = _resolved_report(
+            resolved_file,
+            line=line,
+            character=character,
+            where=where,
+            requested=requested,
+        )
     return result
 
 
@@ -1563,6 +1678,7 @@ async def run_start(
     lifespan_state: dict[str, Any],
     line: int | None = None,
     character: int | None = None,
+    where: str = "after",
     preamble: str = "",
     force_restart: bool = False,
     timeout: float | None = None,
@@ -1594,6 +1710,13 @@ async def run_start(
                 "No valid start mode. Provide file+theorem, "
                 "file+line+character, or preamble."
             ),
+        )
+
+    if where not in _WHERE_VALUES:
+        return _server._fail(
+            lifespan_state,
+            "rocq_start",
+            f"where must be one of {list(_WHERE_VALUES)}, got {where!r}.",
         )
 
     if _start_by_pos:
@@ -1639,6 +1762,7 @@ async def run_start(
                 lifespan_state=lifespan_state,
                 line=line,
                 character=character,
+                where=where,
             )
         return _build_preamble_start_result(
             pet,

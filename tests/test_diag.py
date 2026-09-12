@@ -72,6 +72,7 @@ class TestDiagSchema:
             "live_states",
             "live_states_total",
             "recent_errors",
+            "jobs",
         }
         assert snap["success"] is True
         assert set(snap["pet"].keys()) == {

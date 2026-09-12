@@ -26,6 +26,10 @@ import psutil
 from fastmcp import FastMCP, Context
 from fastmcp.server.lifespan import lifespan
 
+# ``jobs`` deliberately imports nothing from this module, so unlike the
+# sibling implementation modules it can be imported at the top.
+from rocq_mcp import jobs
+
 # ---------------------------------------------------------------------------
 # Configuration (env vars with defaults)
 # ---------------------------------------------------------------------------
@@ -40,25 +44,67 @@ ROCQ_COQC_BINARY: str = os.environ.get("ROCQ_COQC_BINARY", "coqc")
 ROCQ_MAX_SOURCE_SIZE: int = int(os.environ.get("ROCQ_MAX_SOURCE_SIZE", "1000000"))
 
 
-def _check_timeout_config(pet_timeout: float, cap: int) -> str | None:
-    """Return a warning if ROCQ_PET_TIMEOUT exceeds ROCQ_QUERY_TIMEOUT_CAP.
+def _check_timeout_config(
+    pet_timeout: float,
+    cap: int,
+    soft_deadline: float = 0.0,
+    coqc_timeout: float | None = None,
+) -> str | None:
+    """Return a warning if the three timeout knobs are ordered wrongly.
 
-    The cap is documented in the README as the upper bound for the
-    per-call timeout, but ROCQ_PET_TIMEOUT is the fallback when no
-    per-call timeout is given.  If an operator misconfigures the pair
-    so the fallback exceeds the cap, the lock can park longer than the
-    cap promise — silently violating the documented invariant.
+    Two independent misconfigurations are caught, and both messages are
+    returned when both apply:
+
+    ``ROCQ_PET_TIMEOUT`` above ``ROCQ_QUERY_TIMEOUT_CAP``.  The cap is
+    documented in the README as the upper bound for the per-call
+    timeout, but ``ROCQ_PET_TIMEOUT`` is the fallback when no per-call
+    timeout is given.  If an operator misconfigures the pair so the
+    fallback exceeds the cap, the lock can park longer than the cap
+    promise — silently violating the documented invariant.
+
+    A handed-off tool's own timeout at or below ``ROCQ_SOFT_DEADLINE``.
+    The soft deadline only decides when a caller stops *waiting*; the
+    tool's timeout decides when the work is *killed*.  Ordered the wrong
+    way that timeout always fires first, so the background handoff is
+    unreachable: a slow call returns ``reason: "timeout"`` rather than
+    ``status: "pending"`` with the work still running.  Both handed-off
+    tools are checked, since they are bounded by different knobs --
+    ``rocq_start`` by ``ROCQ_PET_TIMEOUT`` (via ``_run_with_pet``) and
+    ``rocq_compile_file`` by ``ROCQ_COQC_TIMEOUT``.  The shipped
+    defaults (30 and 60 against 20) are ordered correctly, so these fire
+    only on a deliberate reconfiguration.
     """
+    msgs: list[str] = []
     if pet_timeout > cap:
-        return (
+        msgs.append(
             f"ROCQ_PET_TIMEOUT={pet_timeout} exceeds ROCQ_QUERY_TIMEOUT_CAP={cap}; "
             f"calls without a per-call timeout= will park the pet lock longer "
             f"than ROCQ_QUERY_TIMEOUT_CAP claims."
         )
-    return None
+    if soft_deadline > 0:
+        for name, value, tool in (
+            ("ROCQ_PET_TIMEOUT", pet_timeout, "rocq_start"),
+            ("ROCQ_COQC_TIMEOUT", coqc_timeout, "rocq_compile_file"),
+        ):
+            if value is None or value > soft_deadline:
+                continue
+            msgs.append(
+                f"{name}={value} is not above "
+                f"ROCQ_SOFT_DEADLINE={soft_deadline}; it fires first, so a "
+                f"slow {tool} is killed at {value}s instead of being handed "
+                f'off as status="pending". Pass timeout= above '
+                f"{soft_deadline} per call, or raise {name}, to get the "
+                f"background handoff."
+            )
+    return " ".join(msgs) if msgs else None
 
 
-_timeout_config_msg = _check_timeout_config(ROCQ_PET_TIMEOUT, ROCQ_QUERY_TIMEOUT_CAP)
+_timeout_config_msg = _check_timeout_config(
+    ROCQ_PET_TIMEOUT,
+    ROCQ_QUERY_TIMEOUT_CAP,
+    jobs.ROCQ_SOFT_DEADLINE,
+    ROCQ_COQC_TIMEOUT,
+)
 if _timeout_config_msg:
     warnings.warn(_timeout_config_msg, RuntimeWarning, stacklevel=2)
 
@@ -262,6 +308,31 @@ def _resolve_call_timeout(
         return None, False
     clamped = timeout > ROCQ_QUERY_TIMEOUT_CAP
     return float(min(timeout, ROCQ_QUERY_TIMEOUT_CAP)), clamped
+
+
+def _job_key(tool: str, workspace: str, **parts: Any) -> str:
+    """Identity of a call, for background-job deduplication.
+
+    Two calls share a key only when they would do the same work against
+    the same bytes.  When *parts* names a ``file``, that file's mtime and
+    size are folded in, so an edit between two otherwise identical calls
+    yields a different key — an edited file is never attached to a job
+    started against its previous contents.
+
+    A file that cannot be stat'd contributes a constant marker rather
+    than an error: the key stays well-defined and the pair of calls
+    simply dedup as before, which is what the pre-job behaviour was.
+    """
+    stamp = "-"
+    file = parts.get("file")
+    if file:
+        try:
+            st = os.stat(_resolve_file_in_workspace(str(file), workspace))
+            stamp = f"{st.st_mtime_ns}:{st.st_size}"
+        except (OSError, ValueError):
+            stamp = "?"
+    body = ",".join(f"{k}={parts[k]!r}" for k in sorted(parts))
+    return f"{tool}|{workspace}|{body}|{stamp}"
 
 
 def _cleanup_coqc_artifacts(tmp_path: str) -> None:
@@ -1897,6 +1968,18 @@ async def rocq_compile_file(
     for large files because the source stays on disk (avoids transmitting
     the full text through the MCP transport).
 
+    **A cold call is handed off, not lost.**  A whole-file compile of a
+    large development can outlive the MCP client's own per-call deadline,
+    so if this call is still running after ``ROCQ_SOFT_DEADLINE`` seconds
+    (default 20) it returns ``status: "pending"`` with a ``job_id``
+    instead of being killed mid-flight.  The compile carries on; collect
+    it with ``rocq_poll(job_id=...)``, or re-issue this identical call,
+    which attaches to the same job rather than starting a second
+    compile.  A ``pending`` envelope is not a failure — never answer one
+    by starting a ``dune build`` or a second compile of your own.  The
+    handoff survives the client's deadline but not ``timeout=`` (see
+    below), which still bounds the compile itself.
+
     On failure, the result includes ``error_positions`` and a ``hint``.
     When coq-lsp is available in the active MCP session, the result
     also includes ``state_capture_status``:
@@ -1979,6 +2062,9 @@ async def rocq_compile_file(
             ``dune-project``; falls back to the ``ROCQ_WORKSPACE`` env var
             (default: cwd).
         timeout: Compilation timeout in seconds (default: ROCQ_COQC_TIMEOUT env var).
+            This, not ``ROCQ_SOFT_DEADLINE``, is what bounds a handed-off
+            compile; size it to the whole compile.  Coqc-routed tools are
+            not subject to ``ROCQ_QUERY_TIMEOUT_CAP``.
         include_warnings: If True (default), include deduplicated warnings
             before the error in the output.  Set to False to get only the
             error diagnostic, which keeps context compact.
@@ -2052,15 +2138,28 @@ async def rocq_compile_file(
         return resolved
     workspace, lifespan_state, ws_warning, clamped, effective_timeout = resolved
 
-    result = await run_compile_file_with_state(
-        file=file,
-        workspace=workspace,
-        timeout=effective_timeout,
-        include_warnings=include_warnings,
-        lifespan_state=lifespan_state,
-        keep_vo=keep_vo,
-        mode=mode,
-        timing=timing,
+    result = await jobs.run_with_soft_deadline(
+        tool="rocq_compile_file",
+        key=_job_key(
+            "rocq_compile_file",
+            workspace,
+            file=file,
+            include_warnings=include_warnings,
+            keep_vo=keep_vo,
+            mode=mode,
+            timing=timing,
+        ),
+        detail=file,
+        factory=lambda: run_compile_file_with_state(
+            file=file,
+            workspace=workspace,
+            timeout=effective_timeout,
+            include_warnings=include_warnings,
+            lifespan_state=lifespan_state,
+            keep_vo=keep_vo,
+            mode=mode,
+            timing=timing,
+        ),
     )
     return _finalize_tool_envelope(result, clamped=clamped, ws_warning=ws_warning)
 
@@ -2477,6 +2576,7 @@ async def rocq_start(
     workspace: str = "",
     line: int | None = None,
     character: int | None = None,
+    where: str = "after",
     preamble: str = "",
     force_restart: bool = False,
     timeout: int = 0,
@@ -2491,6 +2591,15 @@ async def rocq_start(
     ``focus_depth`` — how many ``{...}`` / bullet focus frames are open
     above the goal (0 at the top level) — so a session resumed mid-proof
     knows its bullet nesting (omitted for preamble-only starts).
+
+    **A cold first call is handed off, not lost.**  Replaying a large
+    file's prefix can take minutes, so if this call is still working
+    after ``ROCQ_SOFT_DEADLINE`` seconds (default 20, below the client's
+    own deadline) it returns ``status: "pending"`` with a ``job_id``
+    instead of being killed mid-flight.  The replay carries on; collect
+    it with ``rocq_poll(job_id=...)``, or re-issue this identical call,
+    which attaches to the same job.  Never answer a ``pending`` envelope
+    with a whole-file build.
 
     Three start modes (precedence: theorem > position > preamble):
     1. By theorem: file + theorem — start proving a specific theorem.
@@ -2529,6 +2638,15 @@ async def rocq_start(
     tactic, point at any character of the tactic (including its
     period) or at the whitespace immediately following the period.
 
+    Rather than compute that column yourself, pass ``where``:
+    ``where="before"`` asks for the state before the sentence beginning
+    on ``line`` (``character`` is then ignored), and ``where="after"``
+    (the default) keeps the rounding rule above.  Getting this wrong is
+    the most common way to read an empty ``goals`` and conclude the
+    session is broken, so whenever ``goals`` comes back empty the
+    response also carries ``resolved`` — the position actually used, the
+    text of that line, and which side of it was requested.
+
     **Important:** The interactive session reads the file at start time and
     does not track subsequent edits. If another process or agent modifies the
     file while a session is active, the proof state becomes stale and tactics
@@ -2546,7 +2664,17 @@ async def rocq_start(
             "Position semantics" above for how the cursor is resolved
             to a sentence boundary.
         character: 0-based character offset for position-based start.
-            See "Position semantics" above.
+            See "Position semantics" above.  Ignored when
+            ``where="before"``.
+        where: Which side of the sentence on ``line`` to report, for
+            position-based starts: ``"after"`` (default) applies
+            Petanque's forward-rounding rule to ``line``/``character``
+            as described above; ``"before"`` reports the state before
+            the sentence that begins on ``line``, without the caller
+            having to point at the preceding whitespace.  ``"before"``
+            resolves against the *first* sentence starting on that line;
+            on a line that merely continues a sentence begun earlier it
+            has nothing to move to and behaves as ``"after"``.
         preamble: Import commands for preamble mode (e.g., "Require Import Lia.").
         force_restart: If True, kill pet, clear the state table, and
             respawn before starting.  Recovery primitive for the rare
@@ -2586,16 +2714,38 @@ async def rocq_start(
         return resolved
     workspace, lifespan_state, ws_warning, clamped, effective_timeout = resolved
 
-    result = await run_start(
-        file=file,
-        theorem=theorem,
-        workspace=workspace,
-        lifespan_state=lifespan_state,
-        line=line,
-        character=character,
-        preamble=preamble,
-        force_restart=force_restart,
-        timeout=effective_timeout,
+    if force_restart:
+        # A recovery call must not be answered by the very work it is
+        # trying to escape, so it drops the job table rather than
+        # attaching to anything already in it.
+        jobs.reset()
+
+    result = await jobs.run_with_soft_deadline(
+        tool="rocq_start",
+        key=_job_key(
+            "rocq_start",
+            workspace,
+            file=file,
+            theorem=theorem,
+            line=line,
+            character=character,
+            where=where,
+            preamble=preamble,
+            restart_nonce=time.monotonic_ns() if force_restart else 0,
+        ),
+        detail=theorem or (f"{file}:{line}:{character}" if file else "<preamble>"),
+        factory=lambda: run_start(
+            file=file,
+            theorem=theorem,
+            workspace=workspace,
+            lifespan_state=lifespan_state,
+            line=line,
+            character=character,
+            where=where,
+            preamble=preamble,
+            force_restart=force_restart,
+            timeout=effective_timeout,
+        ),
     )
     return _finalize_tool_envelope(result, clamped=clamped, ws_warning=ws_warning)
 
@@ -2781,6 +2931,65 @@ async def rocq_check(
     if clamped and isinstance(result, dict):
         result["clamped_timeout"] = ROCQ_QUERY_TIMEOUT_CAP
     return result
+
+
+# ---------------------------------------------------------------------------
+# Tool: rocq_poll
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool
+async def rocq_poll(job_id: str, wait: int = 0, ctx: Context = None) -> dict[str, Any]:
+    """Collect the result of a call that was handed off to the background.
+
+    ``rocq_start`` and ``rocq_compile_file`` on a cold file have to
+    replay that file's prefix, which on a large development takes
+    minutes — longer than the per-call deadline MCP clients impose above
+    this server.  Rather than let the client kill such a call, those
+    tools return after ``ROCQ_SOFT_DEADLINE`` seconds (default 20) with::
+
+        {"success": false, "status": "pending", "reason": "warming",
+         "job_id": "job-1", "elapsed_s": 45.0, "retry_after_s": 18}
+
+    **That is not a failure and the work is not lost** — the replay is
+    still running.  Call ``rocq_poll(job_id=...)`` to collect the real
+    result once it lands.  Do not respond to a ``pending`` envelope by
+    falling back to a whole-file build; that throws away the work
+    already done and costs more than waiting for it.
+
+    Poll after roughly ``retry_after_s`` seconds.  Passing ``wait`` lets
+    one call park on the job instead of returning immediately, which is
+    usually the cheaper shape: ``rocq_poll(job_id, wait=40)`` answers as
+    soon as the job lands, or hands back a fresh ``pending`` envelope if
+    it has not landed within 40s.  ``wait`` is clamped to
+    ``ROCQ_SOFT_DEADLINE`` so a poll cannot itself outlive the client's
+    deadline.
+
+    Re-issuing the *identical* original call works too: it attaches to
+    the running job rather than starting a second one.  Only an
+    identical one — a call naming a different position, or the same
+    position after the file was edited, is different work and starts its
+    own job.
+
+    Args:
+        job_id: The ``job_id`` from a ``pending`` envelope.
+        wait: Seconds to wait for the job before answering.  Default 0
+            answers immediately.  Clamped to ``ROCQ_SOFT_DEADLINE``.
+
+    Returns the finished tool result verbatim (the same envelope the
+    original call would have returned), a fresh ``pending`` envelope, or
+    ``reason: "not_found"`` when the id is unknown or its result has
+    expired — results are retained ``ROCQ_JOB_RETENTION`` seconds
+    (default 900) after completion.  ``rocq_diag`` lists live jobs.
+    """
+    if not job_id:
+        return _fail(
+            ctx.lifespan_context if ctx else None,
+            "rocq_poll",
+            "job_id is required. It comes from the `job_id` field of a "
+            "`status: pending` response; rocq_diag lists live jobs.",
+        )
+    return await jobs.poll_job(job_id, wait=wait)
 
 
 @mcp.tool

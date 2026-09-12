@@ -8,6 +8,7 @@ import time
 import pytest
 
 import rocq_mcp.server as _server
+from rocq_mcp import jobs
 from rocq_mcp.interactive import (
     _is_timeout_eligible,
     _compute_hard_timeout,
@@ -149,3 +150,84 @@ class TestTimeoutErrorHint:
         assert "rocq_check(..., timeout=" in result["error"]
         assert "ROCQ_PET_TIMEOUT" in result["error"]
         assert "ROCQ_QUERY_TIMEOUT_CAP" in result["error"]
+
+
+class TestCheckTimeoutConfig:
+    """``_check_timeout_config`` warns on either misordering of the three
+    timeout knobs, and on both at once."""
+
+    def test_silent_when_ordered_correctly(self):
+        """Pet timeout above the soft deadline and below the cap: no warning."""
+        assert _server._check_timeout_config(120.0, 300, 45.0) is None
+
+    def test_warns_when_pet_timeout_exceeds_cap(self):
+        """The pre-existing check: fallback above the documented cap."""
+        msg = _server._check_timeout_config(400.0, 300, 0.0)
+        assert msg is not None
+        assert "ROCQ_QUERY_TIMEOUT_CAP" in msg
+
+    def test_warns_when_pet_timeout_not_above_soft_deadline(self):
+        """A pet timeout below the soft deadline leaves the handoff
+        unreachable, so it must warn and name the knob that fixes it."""
+        msg = _server._check_timeout_config(30.0, 300, 45.0)
+        assert msg is not None
+        assert "ROCQ_SOFT_DEADLINE" in msg
+        assert "timeout=" in msg
+
+    def test_warns_when_equal(self):
+        """Equal is still wrong: the pet timeout must be strictly above, or
+        the two race with no guarantee the handoff wins."""
+        assert _server._check_timeout_config(45.0, 300, 45.0) is not None
+
+    def test_silent_when_handoff_disabled(self):
+        """``ROCQ_SOFT_DEADLINE=0`` disables the handoff, so the ordering is
+        irrelevant and must not warn."""
+        assert _server._check_timeout_config(30.0, 300, 0.0) is None
+
+    def test_reports_both_misorderings_at_once(self):
+        """A pet timeout that is both above the cap and below the soft
+        deadline names both problems rather than masking one."""
+        msg = _server._check_timeout_config(40.0, 30, 45.0)
+        assert msg is not None
+        assert "ROCQ_QUERY_TIMEOUT_CAP" in msg
+        assert "ROCQ_SOFT_DEADLINE" in msg
+
+    def test_warns_when_coqc_timeout_not_above_soft_deadline(self):
+        """rocq_compile_file is bounded by ROCQ_COQC_TIMEOUT, not the pet
+        timeout, so that knob needs its own guard."""
+        msg = _server._check_timeout_config(120.0, 300, 45.0, 15.0)
+        assert msg is not None
+        assert "ROCQ_COQC_TIMEOUT" in msg
+        assert "rocq_compile_file" in msg
+
+    def test_coqc_timeout_omitted_is_not_checked(self):
+        """The argument is optional; omitting it checks only the pet side."""
+        assert _server._check_timeout_config(120.0, 300, 45.0) is None
+
+    def test_names_each_offending_knob_separately(self):
+        """Both tool timeouts below the soft deadline: both are named, so the
+        operator does not fix one and still have a broken handoff."""
+        msg = _server._check_timeout_config(10.0, 300, 45.0, 15.0)
+        assert msg is not None
+        assert "ROCQ_PET_TIMEOUT" in msg
+        assert "ROCQ_COQC_TIMEOUT" in msg
+        assert "rocq_start" in msg
+        assert "rocq_compile_file" in msg
+
+    def test_shipped_defaults_are_ordered_correctly(self):
+        """The defaults must not warn.
+
+        This is the regression guard for the pair actually shipped: the
+        handoff was introduced with a soft deadline *above* the default pet
+        timeout, which left it unreachable out of the box.  Anything that
+        moves either default back into that ordering fails here.
+        """
+        assert (
+            _server._check_timeout_config(
+                _server.ROCQ_PET_TIMEOUT,
+                _server.ROCQ_QUERY_TIMEOUT_CAP,
+                jobs.ROCQ_SOFT_DEADLINE,
+                _server.ROCQ_COQC_TIMEOUT,
+            )
+            is None
+        )

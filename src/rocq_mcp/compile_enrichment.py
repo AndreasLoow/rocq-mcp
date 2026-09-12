@@ -9,6 +9,7 @@ core operation.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 from pathlib import Path
@@ -274,7 +275,12 @@ async def run_compile_with_state(
     lifespan_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Async wrapper for run_compile that enriches failures with PET state."""
-    result = run_compile(source, workspace, timeout, include_warnings)
+    # Off the event loop: run_compile blocks in subprocess.communicate for
+    # the whole compile.  See run_compile_file_with_state for why that
+    # matters even though nothing else shares this coroutine.
+    result = await asyncio.to_thread(
+        run_compile, source, workspace, timeout, include_warnings
+    )
     if lifespan_state is None:
         return result
     if result.get("success"):
@@ -388,7 +394,17 @@ async def run_compile_file_with_state(
     # the same helper; the before/after diff is the only signal.
     ws_path = Path(workspace).resolve()
     vo_before = _server._snapshot_vo_mtimes(ws_path)
-    result = run_compile_file(
+    # Off the event loop.  ``run_compile_file`` blocks in
+    # ``subprocess.communicate`` until coqc / dune returns, which on a large
+    # file is minutes.  Called directly it would freeze the whole server for
+    # that long: no peer tool call is served, the memory watchdog stops
+    # sampling, and -- the reason this is load-bearing -- ``jobs``'
+    # soft-deadline timer cannot fire, so the ``pending`` envelope that is
+    # supposed to arrive at ``ROCQ_SOFT_DEADLINE`` instead arrives only once
+    # the compile has already finished, far too late to beat the client's own
+    # per-call deadline.
+    result = await asyncio.to_thread(
+        run_compile_file,
         file,
         workspace,
         timeout,

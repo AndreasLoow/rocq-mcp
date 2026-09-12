@@ -16,6 +16,7 @@ import psutil
 
 import rocq_mcp as _rocq_mcp  # for __version__
 import rocq_mcp.server as _server
+from rocq_mcp import jobs
 from rocq_mcp.interactive import _state_table
 
 # Maximum number of ``live_states`` entries returned by ``rocq_diag``.
@@ -145,4 +146,8 @@ def _build_diag_snapshot(lifespan_state: dict[str, Any]) -> dict[str, Any]:
         "live_states": live_states,
         "live_states_total": live_states_total,
         "recent_errors": recent_errors,
+        # Background work handed off past the client's per-call deadline.
+        # A "running" entry here is the reason to poll rather than to
+        # re-issue a call or fall back to a whole-file build.
+        "jobs": jobs.snapshot(),
     }
